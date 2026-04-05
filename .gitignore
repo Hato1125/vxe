@@ -1,0 +1,15 @@
+.cache/
+.vscode/
+.zed/
+.idea/
+.fleet/
+
+build/
+
+modules.order
+hid-vxe.mod
+hid-vxe.o
+.modules.order
+.modules.order.cmd
+.hid-vxe.mod.cmd
+.hid-vxe.o.cmd
