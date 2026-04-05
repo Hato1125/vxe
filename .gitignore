@@ -13,3 +13,6 @@ hid-vxe.o
 .modules.order.cmd
 .hid-vxe.mod.cmd
 .hid-vxe.o.cmd
+
+.compile_commands.json.cmd
+compile_commands.json
