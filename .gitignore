@@ -6,13 +6,13 @@
 
 build/
 
+*.o
+*.ko
+*.mod
+*.mod.c
+*.symvers
 modules.order
-hid-vxe.mod
-hid-vxe.o
 .modules.order
-.modules.order.cmd
-.hid-vxe.mod.cmd
-.hid-vxe.o.cmd
+.*.cmd
 
-.compile_commands.json.cmd
 compile_commands.json
