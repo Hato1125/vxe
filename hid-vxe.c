@@ -1,3 +1,4 @@
+#include <linux/device.h>
 #include <linux/hid.h>
 #include <linux/module.h>
 #include <linux/power_supply.h>
@@ -6,14 +7,16 @@
 #include <linux/workqueue.h>
 
 #define VXE_REPORT_ID 0x08
-
-#define VXE_BATTERY_CMD_LEN 16
-#define VXE_BATTERY_CMD_GET 0x04
-
+#define VXE_COMMAND_LEN 16
 #define VXE_BATTERY_TIMEOUT_MS 30000
 
 #define USB_VENDOR_ID_VXE 0x3554
 #define USB_DEVICE_ID_VXE_DRAGONFLY_R1_WL_MS 0xf58a
+
+enum vxe_command {
+  VXE_CMD_GET_BATTERY_LEVEL = 4,
+  VXE_CMD_GET_FIRMWARE_VERSION = 18,
+};
 
 struct vxe_device {
   struct hid_device* hdev;
@@ -28,6 +31,9 @@ struct vxe_device {
   u8 battery_capacity;
   u32 battery_voltage;
   int battery_status;
+
+  u8 firmware_major;
+  u8 firmware_minor;
 };
 
 static enum power_supply_property vxe_battery_props[] = {
@@ -51,20 +57,20 @@ static int vxe_request_battery(struct hid_device* hdev) {
   u8* buf;
   int ret;
 
-  buf = kzalloc(VXE_BATTERY_CMD_LEN + 1, GFP_KERNEL);
+  buf = kzalloc(VXE_COMMAND_LEN + 1, GFP_KERNEL);
   if (!buf)
     return -ENOMEM;
 
   buf[0] = VXE_REPORT_ID;
-  buf[1] = VXE_BATTERY_CMD_GET;
+  buf[1] = VXE_CMD_GET_BATTERY_LEVEL;
 
-  buf[VXE_BATTERY_CMD_LEN] = vxe_checksum(&buf[1], VXE_BATTERY_CMD_LEN);
+  buf[VXE_COMMAND_LEN] = vxe_checksum(&buf[1], VXE_COMMAND_LEN);
 
   ret = hid_hw_raw_request(
     hdev,
     VXE_REPORT_ID,
     buf,
-    VXE_BATTERY_CMD_LEN + 1,
+    VXE_COMMAND_LEN + 1,
     HID_OUTPUT_REPORT,
     HID_REQ_SET_REPORT
   );
@@ -73,6 +79,38 @@ static int vxe_request_battery(struct hid_device* hdev) {
 
   if (ret < 0) {
     hid_err(hdev, "battery request failed %d\n", ret);
+    return ret;
+  }
+
+  return 0;
+}
+
+static int vxe_request_firmware_version(struct hid_device* hdev) {
+  u8* buf;
+  int ret;
+
+  buf = kzalloc(VXE_COMMAND_LEN + 1, GFP_KERNEL);
+  if (!buf)
+    return -ENOMEM;
+
+  buf[0] = VXE_REPORT_ID;
+  buf[1] = VXE_CMD_GET_FIRMWARE_VERSION;
+
+  buf[VXE_COMMAND_LEN] = vxe_checksum(&buf[1], VXE_COMMAND_LEN);
+
+  ret = hid_hw_raw_request(
+    hdev,
+    VXE_REPORT_ID,
+    buf,
+    VXE_COMMAND_LEN + 1,
+    HID_OUTPUT_REPORT,
+    HID_REQ_SET_REPORT
+  );
+
+  kfree(buf);
+
+  if (ret < 0) {
+    hid_err(hdev, "firmware version request failed %d\n", ret);
     return ret;
   }
 
@@ -128,26 +166,40 @@ static int vxe_raw_event(
   if (!device)
     return 0;
 
+  hid_info(hdev, "--- VXE RAW EVENT ---\n");
   hid_info(hdev, "raw_event: size=%d data=%*ph\n", size, size, data);
+  hid_info(hdev, "---------------------\n");
 
   if (size < 8 || data[0] != 0x08)
     return 0;
 
-  if (data[1] != 0x04)
-    return 0;
+  switch (data[1]) {
+  case VXE_CMD_GET_BATTERY_LEVEL:
+    device->battery_capacity = data[6];
+      device->battery_status = data[7]
+        ? POWER_SUPPLY_STATUS_CHARGING
+        : POWER_SUPPLY_STATUS_DISCHARGING;
+      device->battery_voltage = ((data[8] << 8) | data[9]) * 1000;
 
-  device->battery_capacity = data[6];
-  device->battery_status = data[7]
-    ? POWER_SUPPLY_STATUS_CHARGING
-    : POWER_SUPPLY_STATUS_DISCHARGING;
-  device->battery_voltage = ((data[8] << 8) | data[9]) * 1000;
+    if (device->battery)
+      power_supply_changed(device->battery);
 
-  if (device->battery)
-    power_supply_changed(device->battery);
+    spin_lock_irqsave(&device->battery_lock, flags);
+    schedule_delayed_work(&device->battery_work, msecs_to_jiffies(VXE_BATTERY_TIMEOUT_MS));
+    spin_unlock_irqrestore(&device->battery_lock, flags);
+    break;
+  case VXE_CMD_GET_FIRMWARE_VERSION:
+    device->firmware_major = data[6];
+    device->firmware_minor = data[7];
 
-  spin_lock_irqsave(&device->battery_lock, flags);
-  schedule_delayed_work(&device->battery_work, msecs_to_jiffies(VXE_BATTERY_TIMEOUT_MS));
-  spin_unlock_irqrestore(&device->battery_lock, flags);
+    hid_info(
+      hdev,
+      "firmware version: v%d.%02x\n",
+      device->firmware_major,
+      device->firmware_minor
+    );
+    break;
+  }
 
   return 0;
 }
@@ -224,6 +276,7 @@ static int vxe_probe(struct hid_device *hdev, const struct hid_device_id *id) {
   }
 
   INIT_DELAYED_WORK(&device->battery_work, vxe_battery_work_handler);
+  vxe_request_firmware_version(hdev);
   vxe_request_battery(hdev);
   schedule_delayed_work(&device->battery_work, msecs_to_jiffies(VXE_BATTERY_TIMEOUT_MS));
 
