@@ -204,6 +204,23 @@ static int vxe_raw_event(
   return 0;
 }
 
+static ssize_t firmware_version_show(
+  struct device* dev,
+  struct device_attribute* attr,
+  char* buf
+) {
+  struct vxe_device* device = dev_get_drvdata(dev);
+
+  return sysfs_emit(
+    buf,
+    "firmware version: v%d.%02x\n",
+    device->firmware_major,
+    device->firmware_minor
+  );
+}
+
+static DEVICE_ATTR_RO(firmware_version);
+
 static int vxe_probe(struct hid_device *hdev, const struct hid_device_id *id) {
   int ret;
   char* name;
@@ -275,10 +292,13 @@ static int vxe_probe(struct hid_device *hdev, const struct hid_device_id *id) {
     return PTR_ERR(device->battery);
   }
 
-  INIT_DELAYED_WORK(&device->battery_work, vxe_battery_work_handler);
   vxe_request_firmware_version(hdev);
-  vxe_request_battery(hdev);
+  INIT_DELAYED_WORK(&device->battery_work, vxe_battery_work_handler);
   schedule_delayed_work(&device->battery_work, msecs_to_jiffies(VXE_BATTERY_TIMEOUT_MS));
+
+  ret = device_create_file(device->dev, &dev_attr_firmware_version);
+  if (ret)
+    hid_warn(hdev, "failed to create firmeare_version sysfs\n");
 
   return 0;
 }
@@ -287,6 +307,7 @@ static void vxe_remove(struct hid_device *hdev) {
   struct vxe_device *device = hid_get_drvdata(hdev);
 
   if (device) {
+    device_remove_file(&hdev->dev, &dev_attr_firmware_version);
     cancel_delayed_work_sync(&device->battery_work);
     hid_hw_close(hdev);
   }
