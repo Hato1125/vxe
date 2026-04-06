@@ -32,12 +32,14 @@ struct vxe_device {
   struct delayed_work battery_work;
 
   u8 battery_capacity;
+  u32 battery_voltage;
   int battery_status;
 };
 
 static enum power_supply_property vxe_battery_props[] = {
   POWER_SUPPLY_PROP_STATUS,
   POWER_SUPPLY_PROP_CAPACITY,
+  POWER_SUPPLY_PROP_VOLTAGE_NOW,
   POWER_SUPPLY_PROP_SCOPE,
 };
 
@@ -107,6 +109,9 @@ static int vxe_battery_get_property(
   case POWER_SUPPLY_PROP_CAPACITY:
     val->intval = device->battery_capacity;
     break;
+  case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+    val->intval = device->battery_voltage;
+    break;
   case POWER_SUPPLY_PROP_SCOPE:
     val->intval = POWER_SUPPLY_SCOPE_DEVICE;
     break;
@@ -141,6 +146,7 @@ static int vxe_raw_event(
   device->battery_status = data[7]
     ? POWER_SUPPLY_STATUS_CHARGING
     : POWER_SUPPLY_STATUS_DISCHARGING;
+  device->battery_voltage = ((data[8] << 8) | data[9]) * 1000;
 
   if (device->battery)
     power_supply_changed(device->battery);
@@ -185,7 +191,7 @@ static int vxe_probe(struct hid_device *hdev, const struct hid_device_id *id) {
 
   hid_info(hdev, "collection usage: 0x%08x\n", hdev->collection->usage);
 
-  ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+  ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW);
   if (ret) {
     hid_err(hdev, "hid start failed (reason: %d)\n", ret);
     return ret;
