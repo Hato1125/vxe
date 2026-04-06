@@ -213,7 +213,7 @@ static ssize_t firmware_version_show(
 
   return sysfs_emit(
     buf,
-    "firmware version: v%d.%02x\n",
+    "%d.%02x\n",
     device->firmware_major,
     device->firmware_minor
   );
