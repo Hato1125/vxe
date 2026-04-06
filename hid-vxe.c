@@ -1,15 +1,9 @@
 #include <linux/hid.h>
-#include <linux/jiffies.h>
+#include <linux/module.h>
+#include <linux/power_supply.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
-#include <linux/workqueue_types.h>
-#include <linux/hid.h>
-#include <linux/array_size.h>
-#include <linux/power_supply.h>
-#include <linux/gfp_types.h>
-#include <linux/hid.h>
-#include <linux/module.h>
 
 #define VXE_REPORT_ID 0x08
 
