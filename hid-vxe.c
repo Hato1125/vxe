@@ -1,24 +1,19 @@
+#include <linux/usb.h>
 #include <linux/device.h>
 #include <linux/hid.h>
 #include <linux/module.h>
 #include <linux/power_supply.h>
 #include <linux/slab.h>
-#include <linux/spinlock.h>
 #include <linux/workqueue.h>
 
 #define VXE_REPORT_ID 0x08
 #define VXE_COMMAND_LEN 16
-#define VXE_BATTERY_TIMEOUT_MS 30000
+#define VXE_COMMAND_REQUEST_BATTERY_LEVEL 4
+#define VXE_BATTERY_TIMEOUT_MS 3000
 
 #define USB_VENDOR_ID_VXE 0x3554
 #define USB_DEVICE_ID_VXE_DRAGONFLY_R1_WL_MS 0xf58a
-
-enum vxe_command {
-  VXE_CMD_GET_BATTERY_LEVEL = 4,
-  VXE_CMD_SET_EEPROM = 7,
-  VXE_CMD_GET_EEPROM = 8,
-  VXE_CMD_GET_FIRMWARE_VERSION = 18,
-};
+#define USB_DEVICE_ID_VXE_DRAGONFLY_R1_WD_MS 0xf58c
 
 struct vxe_device {
   struct hid_device* hdev;
@@ -27,12 +22,11 @@ struct vxe_device {
   struct power_supply* battery;
   struct power_supply_desc battery_desc;
 
-  spinlock_t battery_lock;
   struct delayed_work battery_work;
 
+  u8 battery_status;
   u8 battery_capacity;
   u32 battery_voltage;
-  int battery_status;
 };
 
 static enum power_supply_property vxe_battery_props[] = {
@@ -61,11 +55,10 @@ static int vxe_request_battery(struct hid_device* hdev) {
     return -ENOMEM;
 
   buf[0] = VXE_REPORT_ID;
-  buf[1] = VXE_CMD_GET_BATTERY_LEVEL;
+  buf[1] = VXE_COMMAND_REQUEST_BATTERY_LEVEL;
 
   buf[VXE_COMMAND_LEN] = vxe_checksum(&buf[1], VXE_COMMAND_LEN);
 
-  hid_info(hdev, "REQUEST BATTERY");
   ret = hid_hw_raw_request(
     hdev,
     VXE_REPORT_ID,
@@ -93,6 +86,7 @@ static void vxe_battery_work_handler(struct work_struct* work) {
   );
 
   vxe_request_battery(device->hdev);
+  schedule_delayed_work(&device->battery_work, msecs_to_jiffies(VXE_BATTERY_TIMEOUT_MS));
 }
 
 static int vxe_battery_get_property(
@@ -128,22 +122,14 @@ static int vxe_raw_event(
   u8 *data,
   int size
 ) {
-  unsigned long flags;
 
   struct vxe_device* device = hid_get_drvdata(hdev);
   if (!device)
     return 0;
 
-  hid_info(hdev, "--- VXE RAW EVENT ---\n");
-  hid_info(hdev, "raw_event_type: %d\n", data[1]);
-  hid_info(hdev, "raw_event: size=%d data=%*ph\n", size, size, data);
-  hid_info(hdev, "---------------------\n");
+  hid_info(hdev, "raw_event: cmd=%d size=%d data=%*ph\n", data[1], size, size, data);
 
-  if (size < 8 || data[0] != 0x08)
-    return 0;
-
-  switch (data[1]) {
-  case VXE_CMD_GET_BATTERY_LEVEL:
+  if (size >= 8 && data[0] == 8 && data[1] == 4) {
     device->battery_capacity = data[6];
       device->battery_status = data[7]
         ? POWER_SUPPLY_STATUS_CHARGING
@@ -152,11 +138,6 @@ static int vxe_raw_event(
 
     if (device->battery)
       power_supply_changed(device->battery);
-
-    spin_lock_irqsave(&device->battery_lock, flags);
-    schedule_delayed_work(&device->battery_work, msecs_to_jiffies(VXE_BATTERY_TIMEOUT_MS));
-    spin_unlock_irqrestore(&device->battery_lock, flags);
-    break;
   }
 
   return 0;
@@ -166,7 +147,12 @@ static int vxe_probe(struct hid_device *hdev, const struct hid_device_id *id) {
   int ret;
   char* name;
   struct vxe_device* device;
+  struct usb_interface* usbif;
 
+  if (!hid_is_usb(hdev))
+    return -EINVAL;
+
+  usbif = to_usb_interface(hdev->dev.parent);
   device = devm_kzalloc(&hdev->dev, sizeof(*device), GFP_KERNEL);
   if (!device)
     return -ENOMEM;
@@ -183,22 +169,17 @@ static int vxe_probe(struct hid_device *hdev, const struct hid_device_id *id) {
     return ret;
   }
 
-  // 0xff050000 is the vendor space. This mouse is already available, so
-  // Interfaces outside the vendor space will be treated as hid-generic.
-  if (hdev->collection->usage != 0xFF050000) {
-    hid_set_drvdata(hdev, NULL);
-    ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
-      if (ret)
-        hid_err(hdev, "hid start failed (reason: %d)\n", ret);
-    return ret;
-  }
-
-  hid_info(hdev, "collection usage: 0x%08x\n", hdev->collection->usage);
-
-  ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW);
+  ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
   if (ret) {
     hid_err(hdev, "hid start failed (reason: %d)\n", ret);
     return ret;
+  }
+
+  // Only enable battery reporting on the dongle's vendor-specific interface
+  if (usbif->altsetting->desc.bInterfaceNumber != 1 ||
+      hdev->product != USB_DEVICE_ID_VXE_DRAGONFLY_R1_WL_MS) {
+    hid_set_drvdata(hdev, NULL);
+    return 0;
   }
 
   ret = hid_hw_open(hdev);
@@ -251,9 +232,8 @@ static void vxe_remove(struct hid_device *hdev) {
 }
 
 static const struct hid_device_id vxe_devices[] = {
-  {
-    HID_USB_DEVICE(USB_VENDOR_ID_VXE, USB_DEVICE_ID_VXE_DRAGONFLY_R1_WL_MS),
-  },
+  { HID_USB_DEVICE(USB_VENDOR_ID_VXE, USB_DEVICE_ID_VXE_DRAGONFLY_R1_WL_MS) },
+  { HID_USB_DEVICE(USB_VENDOR_ID_VXE, USB_DEVICE_ID_VXE_DRAGONFLY_R1_WD_MS) },
   { }
 };
 
