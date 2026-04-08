@@ -15,12 +15,16 @@
 
 enum vxe_command {
   VXE_CMD_GET_BATTERY_LEVEL = 4,
+  VXE_CMD_SET_EEPROM = 7,
+  VXE_CMD_GET_EEPROM = 8,
   VXE_CMD_GET_FIRMWARE_VERSION = 18,
 };
 
 struct vxe_device {
   struct hid_device* hdev;
   struct device* dev;
+
+  struct work_struct init_work;
 
   struct power_supply* battery;
   struct power_supply_desc battery_desc;
@@ -34,6 +38,8 @@ struct vxe_device {
 
   u8 firmware_major;
   u8 firmware_minor;
+
+  u8 sensor_model;
 };
 
 static enum power_supply_property vxe_battery_props[] = {
@@ -117,6 +123,42 @@ static int vxe_request_firmware_version(struct hid_device* hdev) {
   return 0;
 }
 
+static int vxe_request_sensor_model(struct hid_device* hdev) {
+  u8* buf;
+  int ret;
+
+  buf = kzalloc(VXE_COMMAND_LEN + 1, GFP_KERNEL);
+  if (!buf)
+    return -ENOMEM;
+
+  buf[0] = VXE_REPORT_ID;
+  buf[1] = VXE_CMD_GET_EEPROM;
+  buf[2] = 0x00;
+  buf[3] = 0x00;
+  buf[4] = 0xB5;
+  buf[5] = 0x06;
+
+  buf[VXE_COMMAND_LEN] = vxe_checksum(&buf[1], VXE_COMMAND_LEN);
+
+  ret = hid_hw_raw_request(
+    hdev,
+    VXE_REPORT_ID,
+    buf,
+    VXE_COMMAND_LEN + 1,
+    HID_OUTPUT_REPORT,
+    HID_REQ_SET_REPORT
+  );
+
+  kfree(buf);
+
+  if (ret < 0) {
+    hid_err(hdev, "firmware version request failed %d\n", ret);
+    return ret;
+  }
+
+  return 0;
+}
+
 static void vxe_battery_work_handler(struct work_struct* work) {
   struct vxe_device* device = container_of(
     work,
@@ -125,6 +167,16 @@ static void vxe_battery_work_handler(struct work_struct* work) {
   );
 
   vxe_request_battery(device->hdev);
+}
+
+static void vxe_init_work_handler(struct work_struct* work) {
+  struct vxe_device* device = container_of(
+    work,
+    struct vxe_device,
+    init_work
+  );
+
+  vxe_request_sensor_model(device->hdev);
 }
 
 static int vxe_battery_get_property(
@@ -198,6 +250,11 @@ static int vxe_raw_event(
       device->firmware_major,
       device->firmware_minor
     );
+
+    schedule_work(&device->init_work);
+    break;
+  case VXE_CMD_GET_EEPROM:
+    device->sensor_model = data[10];
     break;
   }
 
@@ -220,6 +277,27 @@ static ssize_t firmware_version_show(
 }
 
 static DEVICE_ATTR_RO(firmware_version);
+
+static ssize_t sensor_model_show(
+  struct device* dev,
+  struct device_attribute* attr,
+  char* buf
+) {
+  struct vxe_device* device = dev_get_drvdata(dev);
+
+  switch (device->sensor_model) {
+  case 0:
+    return sysfs_emit(buf, "base\n");
+  case 1:
+    return sysfs_emit(buf, "athleticks\n");
+  case 2:
+    return sysfs_emit(buf, "athleticks_max\n");
+  default:
+    return sysfs_emit(buf, "unknown\n");
+  }
+}
+
+static DEVICE_ATTR_RO(sensor_model);
 
 static int vxe_probe(struct hid_device *hdev, const struct hid_device_id *id) {
   int ret;
@@ -292,6 +370,8 @@ static int vxe_probe(struct hid_device *hdev, const struct hid_device_id *id) {
     return PTR_ERR(device->battery);
   }
 
+  INIT_WORK(&device->init_work, vxe_init_work_handler);
+
   vxe_request_firmware_version(hdev);
   INIT_DELAYED_WORK(&device->battery_work, vxe_battery_work_handler);
   schedule_delayed_work(&device->battery_work, msecs_to_jiffies(VXE_BATTERY_TIMEOUT_MS));
@@ -299,6 +379,10 @@ static int vxe_probe(struct hid_device *hdev, const struct hid_device_id *id) {
   ret = device_create_file(device->dev, &dev_attr_firmware_version);
   if (ret)
     hid_warn(hdev, "failed to create firmeare_version sysfs\n");
+
+  ret = device_create_file(device->dev, &dev_attr_sensor_model);
+  if (ret)
+    hid_warn(hdev, "failed to create sensor model sysfs\n");
 
   return 0;
 }
@@ -308,6 +392,7 @@ static void vxe_remove(struct hid_device *hdev) {
 
   if (device) {
     device_remove_file(&hdev->dev, &dev_attr_firmware_version);
+    device_remove_file(&hdev->dev, &dev_attr_sensor_model);
     cancel_delayed_work_sync(&device->battery_work);
     hid_hw_close(hdev);
   }
